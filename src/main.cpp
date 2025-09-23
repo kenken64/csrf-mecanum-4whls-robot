@@ -20,8 +20,9 @@ String currentDirection = "STOPPED";
 bool motorsLocked = true;  // Channel 8 motor lock state
 
 // Channel mapping constants
-#define CH_THROTTLE 3      // Channel 3: Throttle (backward/stop/forward)
+#define CH_STRAFE 1        // Channel 1: Strafe left/right (mecanum wheels)
 #define CH_SPEED 2         // Channel 2: Speed control
+#define CH_THROTTLE 3      // Channel 3: Throttle (backward/stop/forward)
 #define CH_STEERING 4      // Channel 4: Steering (left/right)
 #define CH_LOCK 8          // Channel 8: Motor lock/unlock
 
@@ -38,6 +39,9 @@ bool motorsLocked = true;  // Channel 8 motor lock state
 // Steering
 #define STEERING_CENTER 1500
 
+// Strafe (Channel 1)
+#define STRAFE_CENTER 1500
+
 // Motor lock
 #define MOTOR_LOCKED 1000
 #define MOTOR_UNLOCKED 2000
@@ -45,6 +49,8 @@ bool motorsLocked = true;  // Channel 8 motor lock state
 // Function declarations
 void moveForward(int speed);
 void moveBackward(int speed);
+void strafeLeft(int speed);   // Simulated strafe left (drift)
+void strafeRight(int speed);  // Simulated strafe right (drift)
 void turnLeft(int speed);
 void turnRight(int speed);
 void stopMotors();
@@ -75,8 +81,9 @@ void setup()
   crsf.begin(Serial1);
   
   Serial.println("Channel Mapping:");
-  Serial.println("  CH3: Throttle (<1472=backward, 1472=stop, >1473=forward)");
+  Serial.println("  CH1: Strafe (>1500=right drift, <1500=left drift) - Simulated");
   Serial.println("  CH2: Speed (1500=base, higher=faster, lower=slower)");
+  Serial.println("  CH3: Throttle (<1472=backward, 1472=stop, >1473=forward)");
   Serial.println("  CH4: Steering (>1500=left, <1500=right)");
   Serial.println("  CH8: Motor Lock (1000=locked, 2000=unlocked)");
   Serial.println("===============================");
@@ -117,6 +124,37 @@ void moveBackward(int speed) {
   digitalWrite(IN3, LOW);
   digitalWrite(IN4, HIGH);
   analogWrite(ENB, speed);
+}
+
+// Simulated mecanum wheel strafing functions for 2-motor setup
+void strafeRight(int speed) {
+  // Simulated strafe right: Rotate right with slight forward bias
+  // Left motor faster forward, right motor slower forward
+  int leftSpeed = speed;
+  int rightSpeed = speed * 0.3;  // Much slower right side creates rightward drift
+  
+  digitalWrite(IN1, HIGH);  // Left motor forward (faster)
+  digitalWrite(IN2, LOW);
+  analogWrite(ENA, leftSpeed);
+
+  digitalWrite(IN3, HIGH);  // Right motor forward (slower)
+  digitalWrite(IN4, LOW);
+  analogWrite(ENB, rightSpeed);
+}
+
+void strafeLeft(int speed) {
+  // Simulated strafe left: Rotate left with slight forward bias  
+  // Right motor faster forward, left motor slower forward
+  int leftSpeed = speed * 0.3;  // Much slower left side creates leftward drift
+  int rightSpeed = speed;
+  
+  digitalWrite(IN1, HIGH);  // Left motor forward (slower)
+  digitalWrite(IN2, LOW);
+  analogWrite(ENA, leftSpeed);
+
+  digitalWrite(IN3, HIGH);  // Right motor forward (faster)
+  digitalWrite(IN4, LOW);
+  analogWrite(ENB, rightSpeed);
 }
 
 void turnLeft(int speed) {
@@ -167,8 +205,9 @@ void processELRS() {
   }
 
   // Get channel values
-  int throttle = crsf.getChannel(CH_THROTTLE);    // Channel 3
+  int strafe = crsf.getChannel(CH_STRAFE);        // Channel 1
   int speedCh = crsf.getChannel(CH_SPEED);        // Channel 2  
+  int throttle = crsf.getChannel(CH_THROTTLE);    // Channel 3
   int steering = crsf.getChannel(CH_STEERING);    // Channel 4
   int lockCh = crsf.getChannel(CH_LOCK);          // Channel 8
 
@@ -196,7 +235,20 @@ void processELRS() {
   }
   motorSpeed = constrain(motorSpeed, SPEED_MIN, SPEED_MAX);
 
-  // Process throttle (Channel 3)
+  // First check for strafe movement (Channel 1) - priority over throttle
+  if (strafe > STRAFE_CENTER + 100) {
+    // Strafe right (simulated with forward + right turn)
+    strafeRight(motorSpeed);
+    currentDirection = "DRIFT RIGHT";
+    return;
+  } else if (strafe < STRAFE_CENTER - 100) {
+    // Strafe left (simulated with forward + left turn)
+    strafeLeft(motorSpeed);
+    currentDirection = "DRIFT LEFT";
+    return;
+  }
+
+  // Process throttle (Channel 3) if no strafe movement
   if (throttle < THROTTLE_BACKWARD_MAX) {
     // Move backward with steering
     if (steering > STEERING_CENTER + 100) {
@@ -297,10 +349,12 @@ void printStatus() {
   Serial.print(currentDirection);
   Serial.print(" | Speed: ");
   Serial.print(motorSpeed);
-  Serial.print(" | CH3:");
-  Serial.print(crsf.getChannel(3));
+  Serial.print(" | CH1:");
+  Serial.print(crsf.getChannel(1));
   Serial.print(" CH2:");
   Serial.print(crsf.getChannel(2));  
+  Serial.print(" CH3:");
+  Serial.print(crsf.getChannel(3));
   Serial.print(" CH4:");
   Serial.print(crsf.getChannel(4));
   Serial.print(" CH8:");
