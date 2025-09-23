@@ -1,0 +1,29 @@
+# Build directories
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Python virtual environment
+pio_env/
+
+# IDE files
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.temp
