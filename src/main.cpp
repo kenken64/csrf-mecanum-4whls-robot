@@ -1,4 +1,6 @@
 #include <AlfredoCRSF.h>
+#include "ArduinoGraphics.h"
+#include "Arduino_LED_Matrix.h"
 
 // L298N motor driver pin connections
 #define ENA 3              // Left motor PWM
@@ -12,6 +14,7 @@
 #define PIN_TX 1
 
 AlfredoCRSF crsf;
+ArduinoLEDMatrix matrix;
 
 // Robot control variables
 int motorSpeed = 60;  // Current speed (60-255)
@@ -57,6 +60,7 @@ void stopMotors();
 void processELRS();
 void printChannels();
 void printStatus();
+void displayMovement(char letter);
 
 void setup()
 {
@@ -74,6 +78,23 @@ void setup()
 
   // Start with motors stopped and locked
   stopMotors();
+  
+  // Initialize LED Matrix
+  matrix.begin();
+  
+  // Test the LED matrix with startup pattern
+  displayMovement('X');  // Show X on startup
+  delay(1000);           // Display for 1 second
+  displayMovement('F');  // Show F
+  delay(500);
+  displayMovement('B');  // Show B  
+  delay(500);
+  displayMovement('L');  // Show L
+  delay(500);
+  displayMovement('R');  // Show R
+  delay(500);
+  displayMovement('X');  // Back to X
+  delay(500);
   
   // Use Serial1 for CRSF communication
   Serial1.begin(CRSF_BAUDRATE);
@@ -201,6 +222,7 @@ void processELRS() {
   if (!crsf.isLinkUp()) {
     stopMotors();
     currentDirection = "NO LINK";
+    displayMovement('X');
     return;
   }
 
@@ -222,6 +244,7 @@ void processELRS() {
   if (motorsLocked) {
     stopMotors();
     currentDirection = "LOCKED";
+    displayMovement('X');
     return;
   }
 
@@ -240,11 +263,13 @@ void processELRS() {
     // Strafe right (simulated with forward + right turn)
     strafeRight(motorSpeed);
     currentDirection = "DRIFT RIGHT";
+    displayMovement('R');
     return;
   } else if (strafe < STRAFE_CENTER - 100) {
     // Strafe left (simulated with forward + left turn)
     strafeLeft(motorSpeed);
     currentDirection = "DRIFT LEFT";
+    displayMovement('L');
     return;
   }
 
@@ -263,6 +288,7 @@ void processELRS() {
       digitalWrite(IN4, HIGH);
       analogWrite(ENB, rightSpeed);
       currentDirection = "BACKWARD LEFT";
+      displayMovement('B');
     } else if (steering < STEERING_CENTER - 100) {
       // Backward + Right steering (left side slower) - INVERTED
       int leftSpeed = motorSpeed * 0.5;   // Left side slower for right turn
@@ -275,10 +301,12 @@ void processELRS() {
       digitalWrite(IN4, HIGH);
       analogWrite(ENB, rightSpeed);
       currentDirection = "BACKWARD RIGHT";
+      displayMovement('B');
     } else {
       // Straight backward
       moveBackward(motorSpeed);
       currentDirection = "BACKWARD";
+      displayMovement('B');
     }
   } else if (throttle > THROTTLE_FORWARD_MIN) {
     // Move forward with steering
@@ -294,6 +322,7 @@ void processELRS() {
       digitalWrite(IN4, LOW);
       analogWrite(ENB, rightSpeed);
       currentDirection = "FORWARD LEFT";
+      displayMovement('F');
     } else if (steering < STEERING_CENTER - 100) {
       // Forward + Right steering (left side slower) - INVERTED
       int leftSpeed = motorSpeed * 0.5;   // Left side slower for right turn
@@ -306,10 +335,12 @@ void processELRS() {
       digitalWrite(IN4, LOW);
       analogWrite(ENB, rightSpeed);
       currentDirection = "FORWARD RIGHT";
+      displayMovement('F');
     } else {
       // Straight forward
       moveForward(motorSpeed);
       currentDirection = "FORWARD";
+      displayMovement('F');
     }
   } else {
     // Throttle at center - check steering only for spot turns
@@ -317,14 +348,17 @@ void processELRS() {
       // Turn left in place - INVERTED
       turnLeft(motorSpeed);
       currentDirection = "TURN LEFT";
+      displayMovement('L');
     } else if (steering < STEERING_CENTER - 100) {
       // Turn right in place - INVERTED
       turnRight(motorSpeed);
       currentDirection = "TURN RIGHT";
+      displayMovement('R');
     } else {
       // Stop
       stopMotors();
       currentDirection = "STOPPED";
+      displayMovement('X');
     }
   }
 }
@@ -359,4 +393,51 @@ void printStatus() {
   Serial.print(crsf.getChannel(4));
   Serial.print(" CH8:");
   Serial.println(crsf.getChannel(8));
+}
+
+void displayMovement(char letter) {
+  // Define 8x12 bitmap patterns for each letter
+  static const uint32_t letterF[3] = {
+    0x0001F800,
+    0x0001F800, 
+    0x0001F800
+  };
+  
+  static const uint32_t letterB[3] = {
+    0x000FFF00,
+    0x000FFF00,
+    0x000FFF00
+  };
+  
+  static const uint32_t letterL[3] = {
+    0x00018180,
+    0x00018180,
+    0x00018180
+  };
+  
+  static const uint32_t letterR[3] = {
+    0x000FFE60,
+    0x000FFE60,
+    0x000FFE60
+  };
+  
+  static const uint32_t letterX[3] = {
+    0x000C3030,
+    0x000C3030,
+    0x000C3030
+  };
+  
+  // Select pattern based on letter
+  const uint32_t* pattern;
+  switch(letter) {
+    case 'F': pattern = letterF; break;
+    case 'B': pattern = letterB; break;
+    case 'L': pattern = letterL; break;
+    case 'R': pattern = letterR; break;
+    case 'X': 
+    default:  pattern = letterX; break;
+  }
+  
+  // Load and display the frame
+  matrix.loadFrame(pattern);
 }
