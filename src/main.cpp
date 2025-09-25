@@ -15,28 +15,80 @@
 AlfredoCRSF crsf;
 
 // Robot control variables
-int motorSpeed = 60;  // Current speed (60-255)
-int baseSpeed = 60;   // Minimum speed
-int previousSpeed = 60;  // Previous speed for change detection
-String currentDirection = "STOPPED";
+int motorSpeed = 60;       // Last applied speed (PWM magnitude 60-255)
+int targetMotorSpeed = 60; // Target speed after filtering/ramping
+int baseSpeed = 60;        // Minimum commanded speed when moving
+int previousSpeed = 60;    // For debugging/rate checks
 bool motorsLocked = true;  // Channel 8 motor lock state
+
+// Direction enumeration replaces dynamic String usage to avoid fragmentation
+enum Direction : uint8_t {
+  DIR_STOPPED,
+  DIR_FORWARD,
+  DIR_BACKWARD,
+  DIR_FORWARD_LEFT,
+  DIR_FORWARD_RIGHT,
+  DIR_BACKWARD_LEFT,
+  DIR_BACKWARD_RIGHT,
+  DIR_DRIFT_LEFT,
+  DIR_DRIFT_RIGHT,
+  DIR_TURN_LEFT,
+  DIR_TURN_RIGHT,
+  DIR_NO_LINK,
+  DIR_LOCKED
+};
+
+Direction currentDirection = DIR_STOPPED;
+Direction previousDirection = DIR_STOPPED;
+
+const char* directionToString(Direction d) {
+  switch(d) {
+    case DIR_STOPPED: return "STOPPED";
+    case DIR_FORWARD: return "FORWARD";
+    case DIR_BACKWARD: return "BACKWARD";
+    case DIR_FORWARD_LEFT: return "FORWARD LEFT";
+    case DIR_FORWARD_RIGHT: return "FORWARD RIGHT";
+    case DIR_BACKWARD_LEFT: return "BACKWARD LEFT";
+    case DIR_BACKWARD_RIGHT: return "BACKWARD RIGHT";
+    case DIR_DRIFT_LEFT: return "DRIFT LEFT";
+    case DIR_DRIFT_RIGHT: return "DRIFT RIGHT";
+    case DIR_TURN_LEFT: return "TURN LEFT";
+    case DIR_TURN_RIGHT: return "TURN RIGHT";
+    case DIR_NO_LINK: return "NO LINK";
+    case DIR_LOCKED: return "LOCKED";
+    default: return "UNKNOWN";
+  }
+}
 
 // Direction change tracking to prevent current spikes
 unsigned long lastDirectionChange = 0;
-#define DIRECTION_CHANGE_DELAY 15  // Reduced from 50ms to 15ms for smoother transitions
-String previousDirection = "STOPPED";
+#define DIRECTION_CHANGE_DELAY 15  // ms guard between directional state changes
 
 // Battery voltage monitoring
-#define VOLTAGE_DIVIDER_RATIO 3.0  // Adjust based on your voltage divider (R1+R2)/R2
-float batteryVoltage = 0.0;
+#define VOLTAGE_DIVIDER_RATIO 3.0  // (R1+R2)/R2 from physical divider
+float batteryVoltage = 0.0f;
 
-// Function to read battery voltage
+// UNO R4 has a 12-bit ADC (0-4095). If using a different board adjust ADC_MAX.
+#ifndef ADC_MAX
+#define ADC_MAX 4095.0f
+#endif
+#ifndef ADC_VREF
+#define ADC_VREF 5.0f
+#endif
+
+// Simple EMA filter for battery voltage
+float batteryVoltageFiltered = 0.0f;
+const float BATTERY_FILTER_ALPHA = 0.1f; // 0<alpha<=1
+
 float readBatteryVoltage() {
-  int adcValue = analogRead(BATTERY_PIN);
-  // Convert ADC value to voltage (5.0V reference, 10-bit ADC = 1023 max)
-  float adcVoltage = (adcValue / 1023.0) * 5.0;
-  // Apply voltage divider ratio
-  return adcVoltage * VOLTAGE_DIVIDER_RATIO;
+  int raw = analogRead(BATTERY_PIN);
+  float v = (raw / ADC_MAX) * ADC_VREF * VOLTAGE_DIVIDER_RATIO;
+  if (batteryVoltageFiltered == 0.0f) {
+    batteryVoltageFiltered = v;
+  } else {
+    batteryVoltageFiltered += BATTERY_FILTER_ALPHA * (v - batteryVoltageFiltered);
+  }
+  return batteryVoltageFiltered;
 }
 
 // Channel change detection
@@ -48,9 +100,8 @@ unsigned long lastSpeedChange = 0;
 
 // Speed filtering variables
 float filteredSpeedCh = 1500.0;  // Filtered channel value
-int targetMotorSpeed = 60;       // Target speed after filtering
 unsigned long lastFilterUpdate = 0;
-#define FILTER_UPDATE_INTERVAL 20  // Update filter every 20ms
+#define FILTER_UPDATE_INTERVAL 20  // ms between filter updates
 
 // Channel mapping constants
 #define CH_STRAFE 1        // Channel 1: Strafe left/right (mecanum wheels)
@@ -193,32 +244,25 @@ void strafeLeft(int speed) {
   analogWrite(ENB, rightSpeed);
 }
 
+// Pivot turning (in-place): one motor forward, one backward
 void turnLeft(int speed) {
-  // Left wheels slower, right wheels at full speed for gradual left turn
-  int leftSpeed = speed * 0.3;   // Left side much slower
-  int rightSpeed = speed;        // Right side full speed
-  
   digitalWrite(IN1, HIGH);
   digitalWrite(IN2, LOW);
-  analogWrite(ENA, leftSpeed);
+  analogWrite(ENA, speed);
 
-  digitalWrite(IN3, HIGH);
-  digitalWrite(IN4, LOW);
-  analogWrite(ENB, rightSpeed);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENB, speed);
 }
 
 void turnRight(int speed) {
-  // Right wheels slower, left wheels at full speed for gradual right turn  
-  int leftSpeed = speed;         // Left side full speed
-  int rightSpeed = speed * 0.3;  // Right side much slower
-  
-  digitalWrite(IN1, HIGH);
-  digitalWrite(IN2, LOW);
-  analogWrite(ENA, leftSpeed);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  analogWrite(ENA, speed);
 
   digitalWrite(IN3, HIGH);
   digitalWrite(IN4, LOW);
-  analogWrite(ENB, rightSpeed);
+  analogWrite(ENB, speed);
 }
 
 void stopMotors() {
@@ -236,35 +280,37 @@ void processELRS() {
   // Check if link is up and handle connection issues
   if (!crsf.isLinkUp()) {
     stopMotors();
-    currentDirection = "NO LINK";
-    
-    // Reset previous values when connection lost
+    currentDirection = DIR_NO_LINK;
     previousSpeedCh = 1500;
-    motorSpeed = baseSpeed;
+    filteredSpeedCh = 1500.0f;
+    targetMotorSpeed = baseSpeed;
     previousSpeed = baseSpeed;
-    
-    Serial.println("ELRS Link Lost - Resetting speed values");
+    // Throttle link-loss logging (every 2s max)
+    static unsigned long lastLossLog=0; 
+    if (millis() - lastLossLog > 2000) {
+      Serial.println("ELRS Link Lost - Resetting speed values");
+      lastLossLog = millis();
+    }
     return;
   }
 
   // Get channel values with validation
-  int strafe = crsf.getChannel(CH_STRAFE);        // Channel 1
-  int speedCh = crsf.getChannel(CH_SPEED);        // Channel 2  
-  int throttle = crsf.getChannel(CH_THROTTLE);    // Channel 3
-  int steering = crsf.getChannel(CH_STEERING);    // Channel 4
-  int lockCh = crsf.getChannel(CH_LOCK);          // Channel 8
+  // Snapshot channels once for consistency
+  int strafe = crsf.getChannel(CH_STRAFE);
+  int speedCh = crsf.getChannel(CH_SPEED);
+  int throttle = crsf.getChannel(CH_THROTTLE);
+  int steering = crsf.getChannel(CH_STEERING);
+  int lockCh = crsf.getChannel(CH_LOCK);
 
   // Validate channel values (CRSF should be 1000-2000)
-  if (speedCh < 500 || speedCh > 2500) {
-    Serial.print("Invalid CH2 value: ");
-    Serial.println(speedCh);
-    return; // Skip this cycle if invalid data
-  }
-  
-  if (throttle < 500 || throttle > 2500) {
-    Serial.print("Invalid CH3 value: ");
-    Serial.println(throttle);
-    return; // Skip this cycle if invalid data
+  bool invalid = false;
+  if (speedCh < 800 || speedCh > 2200) { invalid = true; }
+  if (throttle < 800 || throttle > 2200) { invalid = true; }
+  if (invalid) {
+    // Fail-safe: stop motion but keep processing lock + battery
+    stopMotors();
+    currentDirection = DIR_STOPPED;
+    return; // Keep last good filtered values
   }
 
   // Update motor lock status
@@ -277,7 +323,7 @@ void processELRS() {
   // If motors are locked, stop and return
   if (motorsLocked) {
     stopMotors();
-    currentDirection = "LOCKED";
+    currentDirection = DIR_LOCKED;
     return;
   }
 
@@ -326,12 +372,13 @@ void processELRS() {
 
     // Ensure motor speed stays within bounds
     targetMotorSpeed = constrain(targetMotorSpeed, SPEED_MIN, SPEED_MAX);
-    motorSpeed = targetMotorSpeed;
+  int oldApplied = motorSpeed;
+  motorSpeed = targetMotorSpeed; // desired new applied speed
     lastSpeedChange = millis();
 
     // Detect and warn about rapid channel changes that could cause ELRS resets
     int channelChange = abs(speedCh - previousSpeedCh);
-    if (channelChange > 300) { // Increased threshold for warning
+    if (channelChange > 300) { // extreme raw delta
       Serial.print("WARNING: Extreme speed change detected! CH2: ");
       Serial.print(speedCh);
       Serial.print(" (previous: ");
@@ -340,29 +387,48 @@ void processELRS() {
       Serial.print(smoothedSpeedCh);
       Serial.print(" -> Speed: ");
       Serial.println(motorSpeed);
-
-      // Additional protection: temporarily increase delay after extreme changes
-      lastSpeedChange = millis() + 200; // Add extra 200ms delay
     }
 
     previousSpeedCh = speedCh;
   }
 
+  // If speed changed but direction didn't update (e.g., staying FORWARD) refresh PWM outputs
+  static int lastAppliedPwm = -1;
+  if (motorSpeed != lastAppliedPwm) {
+    switch(currentDirection) {
+      case DIR_FORWARD: moveForward(motorSpeed); break;
+      case DIR_BACKWARD: moveBackward(motorSpeed); break;
+      case DIR_DRIFT_LEFT: strafeLeft(motorSpeed); break;
+      case DIR_DRIFT_RIGHT: strafeRight(motorSpeed); break;
+      case DIR_FORWARD_LEFT:
+      case DIR_FORWARD_RIGHT:
+      case DIR_BACKWARD_LEFT:
+      case DIR_BACKWARD_RIGHT:
+      case DIR_TURN_LEFT:
+      case DIR_TURN_RIGHT:
+      case DIR_STOPPED:
+      case DIR_NO_LINK:
+      case DIR_LOCKED:
+      default: /* specific branches already set outputs */ break;
+    }
+    lastAppliedPwm = motorSpeed;
+  }
+
   // First check for strafe movement (Channel 1) - priority over throttle
   if (strafe > STRAFE_CENTER + 100) {
     // Strafe right (simulated with forward + right turn)
-    if (currentDirection != "DRIFT RIGHT" && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
+    if (currentDirection != DIR_DRIFT_RIGHT && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
       strafeRight(motorSpeed);
-      currentDirection = "DRIFT RIGHT";
+      currentDirection = DIR_DRIFT_RIGHT;
       previousDirection = currentDirection;
       lastDirectionChange = millis();
       return;
     }
   } else if (strafe < STRAFE_CENTER - 100) {
     // Strafe left (simulated with forward + left turn)
-    if (currentDirection != "DRIFT LEFT" && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
+    if (currentDirection != DIR_DRIFT_LEFT && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
       strafeLeft(motorSpeed);
-      currentDirection = "DRIFT LEFT";
+      currentDirection = DIR_DRIFT_LEFT;
       previousDirection = currentDirection;
       lastDirectionChange = millis();
       return;
@@ -374,7 +440,7 @@ void processELRS() {
     // Move backward with steering
     if (steering > STEERING_CENTER + 100) {
       // Backward + Left steering (right side slower) - INVERTED
-      if (currentDirection != "BACKWARD LEFT" && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
+      if (currentDirection != DIR_BACKWARD_LEFT && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
         int leftSpeed = motorSpeed;
         int rightSpeed = motorSpeed * 0.5;  // Right side slower for left turn
 
@@ -384,13 +450,13 @@ void processELRS() {
         digitalWrite(IN3, LOW);
         digitalWrite(IN4, HIGH);
         analogWrite(ENB, rightSpeed);
-        currentDirection = "BACKWARD LEFT";
+  currentDirection = DIR_BACKWARD_LEFT;
         previousDirection = currentDirection;
         lastDirectionChange = millis();
       }
     } else if (steering < STEERING_CENTER - 100) {
       // Backward + Right steering (left side slower) - INVERTED
-      if (currentDirection != "BACKWARD RIGHT" && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
+      if (currentDirection != DIR_BACKWARD_RIGHT && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
         int leftSpeed = motorSpeed * 0.5;   // Left side slower for right turn
         int rightSpeed = motorSpeed;
 
@@ -400,15 +466,15 @@ void processELRS() {
         digitalWrite(IN3, LOW);
         digitalWrite(IN4, HIGH);
         analogWrite(ENB, rightSpeed);
-        currentDirection = "BACKWARD RIGHT";
+  currentDirection = DIR_BACKWARD_RIGHT;
         previousDirection = currentDirection;
         lastDirectionChange = millis();
       }
     } else {
       // Straight backward
-      if (currentDirection != "BACKWARD" && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
+      if (currentDirection != DIR_BACKWARD && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
         moveBackward(motorSpeed);
-        currentDirection = "BACKWARD";
+        currentDirection = DIR_BACKWARD;
         previousDirection = currentDirection;
         lastDirectionChange = millis();
       }
@@ -417,7 +483,7 @@ void processELRS() {
     // Move forward with steering
     if (steering > STEERING_CENTER + 100) {
       // Forward + Left steering (right side slower) - INVERTED
-      if (currentDirection != "FORWARD LEFT" && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
+      if (currentDirection != DIR_FORWARD_LEFT && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
         int leftSpeed = motorSpeed;
         int rightSpeed = motorSpeed * 0.5;  // Right side slower for left turn
 
@@ -427,13 +493,13 @@ void processELRS() {
         digitalWrite(IN3, HIGH);
         digitalWrite(IN4, LOW);
         analogWrite(ENB, rightSpeed);
-        currentDirection = "FORWARD LEFT";
+  currentDirection = DIR_FORWARD_LEFT;
         previousDirection = currentDirection;
         lastDirectionChange = millis();
       }
     } else if (steering < STEERING_CENTER - 100) {
       // Forward + Right steering (left side slower) - INVERTED
-      if (currentDirection != "FORWARD RIGHT" && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
+      if (currentDirection != DIR_FORWARD_RIGHT && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
         int leftSpeed = motorSpeed * 0.5;   // Left side slower for right turn
         int rightSpeed = motorSpeed;
 
@@ -443,15 +509,15 @@ void processELRS() {
         digitalWrite(IN3, HIGH);
         digitalWrite(IN4, LOW);
         analogWrite(ENB, rightSpeed);
-        currentDirection = "FORWARD RIGHT";
+  currentDirection = DIR_FORWARD_RIGHT;
         previousDirection = currentDirection;
         lastDirectionChange = millis();
       }
     } else {
       // Straight forward
-      if (currentDirection != "FORWARD" && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
+      if (currentDirection != DIR_FORWARD && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
         moveForward(motorSpeed);
-        currentDirection = "FORWARD";
+        currentDirection = DIR_FORWARD;
         previousDirection = currentDirection;
         lastDirectionChange = millis();
       }
@@ -460,25 +526,25 @@ void processELRS() {
     // Throttle at center - check steering only for spot turns
     if (steering > STEERING_CENTER + 100) {
       // Turn left in place - INVERTED
-      if (currentDirection != "TURN LEFT" && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
+      if (currentDirection != DIR_TURN_LEFT && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
         turnLeft(motorSpeed);
-        currentDirection = "TURN LEFT";
+        currentDirection = DIR_TURN_LEFT;
         previousDirection = currentDirection;
         lastDirectionChange = millis();
       }
     } else if (steering < STEERING_CENTER - 100) {
       // Turn right in place - INVERTED
-      if (currentDirection != "TURN RIGHT" && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
+      if (currentDirection != DIR_TURN_RIGHT && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
         turnRight(motorSpeed);
-        currentDirection = "TURN RIGHT";
+        currentDirection = DIR_TURN_RIGHT;
         previousDirection = currentDirection;
         lastDirectionChange = millis();
       }
     } else {
       // Stop
-      if (currentDirection != "STOPPED" && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
+      if (currentDirection != DIR_STOPPED && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
         stopMotors();
-        currentDirection = "STOPPED";
+        currentDirection = DIR_STOPPED;
         previousDirection = currentDirection;
         lastDirectionChange = millis();
       }
@@ -506,7 +572,7 @@ void printStatus() {
   Serial.print(" | Lock: ");
   Serial.print(motorsLocked ? "ON" : "OFF");
   Serial.print(" | Dir: ");
-  Serial.print(currentDirection);
+  Serial.print(directionToString(currentDirection));
   Serial.print(" | Speed: ");
   Serial.print(motorSpeed);
   Serial.print(" | Batt:");
