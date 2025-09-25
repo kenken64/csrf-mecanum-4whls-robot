@@ -67,6 +67,14 @@ unsigned long lastDirectionChange = 0;
 // Battery voltage monitoring
 #define VOLTAGE_DIVIDER_RATIO 3.0  // (R1+R2)/R2 from physical divider
 float batteryVoltage = 0.0f;
+// Low battery failsafe thresholds (example for 2S LiPo; adjust as needed)
+#define LOW_BATTERY_WARN 7.2f     // Warning threshold (V)
+#define LOW_BATTERY_LIMIT 6.8f    // Enter throttled mode (V)
+#define LOW_BATTERY_CUTOFF 6.6f   // Hard cutoff stop (V)
+#define LOW_BATTERY_RELEASE 7.0f  // Hysteresis release voltage (V)
+bool lowBatteryWarned = false;
+bool lowBatteryThrottled = false;
+bool lowBatteryCutoff = false;
 
 // UNO R4 has a 12-bit ADC (0-4095). If using a different board adjust ADC_MAX.
 #ifndef ADC_MAX
@@ -119,6 +127,10 @@ unsigned long lastFilterUpdate = 0;
 #define SPEED_CENTER 1500
 #define SPEED_MIN 60
 #define SPEED_MAX 255
+
+// Integer scaling factors (replaces floating multipliers)
+#define SCALE_30(percentVal) ((percentVal) * 30 / 100) // 30% of value
+#define SCALE_50(percentVal) ((percentVal) >> 1)       // 50% of value
 
 // Steering
 #define STEERING_CENTER 1500
@@ -218,7 +230,7 @@ void strafeRight(int speed) {
   // Simulated strafe right: Rotate right with slight forward bias
   // Left motor faster forward, right motor slower forward
   int leftSpeed = speed;
-  int rightSpeed = speed * 0.3;  // Much slower right side creates rightward drift
+  int rightSpeed = SCALE_30(speed);  // Much slower right side creates rightward drift
   
   digitalWrite(IN1, HIGH);  // Left motor forward (faster)
   digitalWrite(IN2, LOW);
@@ -232,7 +244,7 @@ void strafeRight(int speed) {
 void strafeLeft(int speed) {
   // Simulated strafe left: Rotate left with slight forward bias  
   // Right motor faster forward, left motor slower forward
-  int leftSpeed = speed * 0.3;  // Much slower left side creates leftward drift
+  int leftSpeed = SCALE_30(speed);  // Much slower left side creates leftward drift
   int rightSpeed = speed;
   
   digitalWrite(IN1, HIGH);  // Left motor forward (slower)
@@ -294,6 +306,10 @@ void processELRS() {
     return;
   }
 
+  // Stale frame watchdog: if channels not changing for extended period while link claims up, could indicate freeze
+  static unsigned long lastFrameActivity = 0;
+  bool frameActive = false; // set true when we detect any channel deviation > threshold
+
   // Get channel values with validation
   // Snapshot channels once for consistency
   int strafe = crsf.getChannel(CH_STRAFE);
@@ -301,6 +317,17 @@ void processELRS() {
   int throttle = crsf.getChannel(CH_THROTTLE);
   int steering = crsf.getChannel(CH_STEERING);
   int lockCh = crsf.getChannel(CH_LOCK);
+
+  // Detect activity
+  if (abs(speedCh - previousSpeedCh) > 5) frameActive = true;
+  if (frameActive) lastFrameActivity = millis();
+  else if (millis() - lastFrameActivity > 1500) {
+    // Failsafe if stale >1.5s
+    stopMotors();
+    currentDirection = DIR_STOPPED;
+    // Don't return immediately; still allow battery processing, but freeze motion
+    return;
+  }
 
   // Validate channel values (CRSF should be 1000-2000)
   bool invalid = false;
@@ -325,6 +352,40 @@ void processELRS() {
     stopMotors();
     currentDirection = DIR_LOCKED;
     return;
+  }
+
+  // Battery voltage & failsafe state update
+  batteryVoltage = readBatteryVoltage();
+  if (!lowBatteryCutoff) {
+    if (batteryVoltage <= LOW_BATTERY_CUTOFF) {
+      lowBatteryCutoff = true;
+      Serial.println("LOW BATTERY CUTOFF - Motors disabled");
+      stopMotors();
+    } else if (batteryVoltage <= LOW_BATTERY_LIMIT) {
+      if (!lowBatteryThrottled) {
+        Serial.println("LOW BATTERY - Throttling speed");
+      }
+      lowBatteryThrottled = true;
+    } else if (batteryVoltage <= LOW_BATTERY_WARN) {
+      if (!lowBatteryWarned) {
+        Serial.println("LOW BATTERY WARNING");
+        lowBatteryWarned = true;
+      }
+    } else if (batteryVoltage >= LOW_BATTERY_RELEASE) {
+      // Recover flags when voltage rises sufficiently (e.g., after load removed)
+      if (lowBatteryThrottled || lowBatteryWarned) {
+        Serial.println("Battery level recovered - exiting low battery mode");
+      }
+      lowBatteryWarned = false;
+      lowBatteryThrottled = false;
+      // Cutoff stays latched until reset (safety) unless you wish to auto-clear:
+      // lowBatteryCutoff = false; // uncomment if auto clear desired
+    }
+  }
+  if (lowBatteryCutoff) {
+    stopMotors();
+    currentDirection = DIR_STOPPED;
+    return; // Hard stop
   }
 
   // Apply exponential smoothing to speed channel to prevent rapid changes
@@ -353,6 +414,11 @@ void processELRS() {
     newTargetSpeed = map(smoothedSpeedCh, 1000, SPEED_CENTER, SPEED_MIN, baseSpeed);
   }
   newTargetSpeed = constrain(newTargetSpeed, SPEED_MIN, SPEED_MAX);
+  if (lowBatteryThrottled) {
+    // Scale down target speed (e.g., 60%) during throttle mode
+    newTargetSpeed = (newTargetSpeed * 60) / 100;
+    if (newTargetSpeed < SPEED_MIN) newTargetSpeed = SPEED_MIN;
+  }
 
   // Update target speed with rate limiting
   if (millis() - lastSpeedChange > SPEED_CHANGE_DELAY) {
@@ -441,8 +507,8 @@ void processELRS() {
     if (steering > STEERING_CENTER + 100) {
       // Backward + Left steering (right side slower) - INVERTED
       if (currentDirection != DIR_BACKWARD_LEFT && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
-        int leftSpeed = motorSpeed;
-        int rightSpeed = motorSpeed * 0.5;  // Right side slower for left turn
+  int leftSpeed = motorSpeed;
+  int rightSpeed = SCALE_50(motorSpeed);  // Right side slower for left turn
 
         digitalWrite(IN1, LOW);
         digitalWrite(IN2, HIGH);
@@ -457,7 +523,7 @@ void processELRS() {
     } else if (steering < STEERING_CENTER - 100) {
       // Backward + Right steering (left side slower) - INVERTED
       if (currentDirection != DIR_BACKWARD_RIGHT && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
-        int leftSpeed = motorSpeed * 0.5;   // Left side slower for right turn
+  int leftSpeed = SCALE_50(motorSpeed);   // Left side slower for right turn
         int rightSpeed = motorSpeed;
 
         digitalWrite(IN1, LOW);
@@ -484,8 +550,8 @@ void processELRS() {
     if (steering > STEERING_CENTER + 100) {
       // Forward + Left steering (right side slower) - INVERTED
       if (currentDirection != DIR_FORWARD_LEFT && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
-        int leftSpeed = motorSpeed;
-        int rightSpeed = motorSpeed * 0.5;  // Right side slower for left turn
+  int leftSpeed = motorSpeed;
+  int rightSpeed = SCALE_50(motorSpeed);  // Right side slower for left turn
 
         digitalWrite(IN1, HIGH);
         digitalWrite(IN2, LOW);
@@ -500,7 +566,7 @@ void processELRS() {
     } else if (steering < STEERING_CENTER - 100) {
       // Forward + Right steering (left side slower) - INVERTED
       if (currentDirection != DIR_FORWARD_RIGHT && millis() - lastDirectionChange > DIRECTION_CHANGE_DELAY) {
-        int leftSpeed = motorSpeed * 0.5;   // Left side slower for right turn
+  int leftSpeed = SCALE_50(motorSpeed);   // Left side slower for right turn
         int rightSpeed = motorSpeed;
 
         digitalWrite(IN1, HIGH);
